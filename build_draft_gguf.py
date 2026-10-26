@@ -14,10 +14,14 @@ Supports two modes:
 
 import argparse
 import os
+import pickle
 import struct
 from typing import Dict, List, Tuple
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 GGUF_DEFAULT_ALIGNMENT = 32
 
@@ -167,10 +171,10 @@ def quantize_q4_0(weight_f32: np.ndarray) -> bytes:
 
 HF_TO_GGUF_LAYER_MAP = [
     ("input_layernorm.weight", "attn_norm.weight", "F32", None),
-    ("self_attn.q_proj.weight", "attn_q.weight", "Q8_0", 56),
+    ("self_attn.q_proj.weight", "attn_q.weight", "Q4_0", 56),
     ("self_attn.k_proj.weight", "attn_k.weight", "Q8_0", 8),
     ("self_attn.v_proj.weight", "attn_v.weight", "Q8_0", None),
-    ("self_attn.o_proj.weight", "attn_output.weight", "Q8_0", None),
+    ("self_attn.o_proj.weight", "attn_output.weight", "Q4_0", None),
     ("post_attention_layernorm.weight", "ffn_norm.weight", "F32", None),
     ("mlp.gate_proj.weight", "ffn_gate.weight", "Q4_0", None),
     ("mlp.up_proj.weight", "ffn_up.weight", "Q4_0", None),
@@ -187,10 +191,54 @@ def pack_tensor_info(name: str, dims: List[int], ggml_type: int, rel_offset: int
     return b"".join(buf)
 
 
+def quantize_safetensors_layers(
+    safetensors_path: str,
+    num_draft_layers: int = 4,
+) -> List[Tuple[str, List[int], int, bytes]]:
+    import torch
+    from safetensors.torch import load_file
+
+    print(f"Loading distilled layers from {safetensors_path}...")
+    st_dict = load_file(safetensors_path, device="cpu")
+    quantized_layers: List[Tuple[str, List[int], int, bytes]] = []
+    for dst_idx in range(num_draft_layers):
+        print(f"Quantizing distilled layer {dst_idx}/{num_draft_layers - 1}...")
+        for hf_suffix, gguf_suffix, qmode, n_head_perm in HF_TO_GGUF_LAYER_MAP:
+            st_key = f"layers.{dst_idx}.{hf_suffix}"
+            if st_key not in st_dict:
+                st_key = f"model.layers.{dst_idx}.{hf_suffix}"
+            w_np = st_dict[st_key].to(torch.float32).numpy()
+            if n_head_perm is not None:
+                w_np = permute_qk_hf_to_ggml(w_np, n_head_perm)
+
+            if w_np.ndim == 1:
+                dims = [w_np.shape[0]]
+            else:
+                out_f, in_f = w_np.shape
+                dims = [in_f, out_f]
+
+            if qmode == "F32":
+                ggml_type = GGML_TYPE_F32
+                raw_bytes = np.ascontiguousarray(w_np, dtype=np.float32).tobytes()
+            elif qmode == "Q8_0":
+                ggml_type = GGML_TYPE_Q8_0
+                raw_bytes = quantize_q8_0(w_np)
+            elif qmode == "Q4_0":
+                ggml_type = GGML_TYPE_Q4_0
+                raw_bytes = quantize_q4_0(w_np)
+            else:
+                raise ValueError(f"Unknown qmode: {qmode}")
+
+            dst_name = f"blk.{dst_idx}.{gguf_suffix}"
+            quantized_layers.append((dst_name, dims, ggml_type, raw_bytes))
+    return quantized_layers
+
+
 def build_draft_gguf(
     base_gguf_path: str,
     out_gguf_path: str,
     safetensors_path: str = None,
+    import_quantized_path: str = None,
     anchor_layers: List[int] = [0, 17, 34, 51],
 ) -> None:
     meta = parse_gguf_with_block_count_offset(base_gguf_path)
@@ -201,9 +249,9 @@ def build_draft_gguf(
     with open(base_gguf_path, "rb") as f_base:
         kv_header = bytearray(f_base.read(meta["kv_end"]))
 
-    # Patch n_tensors (bytes 12..20) and llama.block_count
+    # Patch n_tensors (bytes 8..16) and llama.block_count
     total_tensors = 3 + num_draft_layers * len(HF_TO_GGUF_LAYER_MAP)
-    struct.pack_into("<Q", kv_header, 12, total_tensors)
+    struct.pack_into("<Q", kv_header, 8, total_tensors)
     struct.pack_into("<I", kv_header, meta["block_count_val_offset"], num_draft_layers)
 
     prepared_tensors: List[Tuple[str, List[int], int, bytes]] = []
@@ -217,7 +265,7 @@ def build_draft_gguf(
             raw_bytes = f_base.read(tinfo["byte_size"])
             prepared_tensors.append((tname, tinfo["dims"], tinfo["type"], raw_bytes))
 
-        if safetensors_path is None:
+        if safetensors_path is None and import_quantized_path is None:
             # Mode B: Zero-shot slice of anchor layers directly from base_gguf
             for dst_idx, src_idx in enumerate(anchor_layers):
                 for _, gguf_suffix, _, _ in HF_TO_GGUF_LAYER_MAP:
@@ -228,43 +276,12 @@ def build_draft_gguf(
                     raw_bytes = f_base.read(tinfo["byte_size"])
                     prepared_tensors.append((dst_name, tinfo["dims"], tinfo["type"], raw_bytes))
 
-    if safetensors_path is not None:
-        # Mode A: Distilled Safetensors -> quantized GGUF layers
-        import torch
-        from safetensors.torch import load_file
-
-        print(f"Loading distilled layers from {safetensors_path}...")
-        st_dict = load_file(safetensors_path, device="cpu")
-        for dst_idx in range(num_draft_layers):
-            print(f"Quantizing distilled layer {dst_idx}/{num_draft_layers - 1}...")
-            for hf_suffix, gguf_suffix, qmode, n_head_perm in HF_TO_GGUF_LAYER_MAP:
-                st_key = f"layers.{dst_idx}.{hf_suffix}"
-                if st_key not in st_dict:
-                    st_key = f"model.layers.{dst_idx}.{hf_suffix}"
-                w_np = st_dict[st_key].to(torch.float32).numpy()
-                if n_head_perm is not None:
-                    w_np = permute_qk_hf_to_ggml(w_np, n_head_perm)
-
-                if w_np.ndim == 1:
-                    dims = [w_np.shape[0]]
-                else:
-                    out_f, in_f = w_np.shape
-                    dims = [in_f, out_f]
-
-                if qmode == "F32":
-                    ggml_type = GGML_TYPE_F32
-                    raw_bytes = np.ascontiguousarray(w_np, dtype=np.float32).tobytes()
-                elif qmode == "Q8_0":
-                    ggml_type = GGML_TYPE_Q8_0
-                    raw_bytes = quantize_q8_0(w_np)
-                elif qmode == "Q4_0":
-                    ggml_type = GGML_TYPE_Q4_0
-                    raw_bytes = quantize_q4_0(w_np)
-                else:
-                    raise ValueError(f"Unknown qmode: {qmode}")
-
-                dst_name = f"blk.{dst_idx}.{gguf_suffix}"
-                prepared_tensors.append((dst_name, dims, ggml_type, raw_bytes))
+    if import_quantized_path is not None:
+        print(f"Importing pre-quantized layers from {import_quantized_path}...")
+        with open(import_quantized_path, "rb") as fq:
+            prepared_tensors.extend(pickle.load(fq))
+    elif safetensors_path is not None:
+        prepared_tensors.extend(quantize_safetensors_layers(safetensors_path, num_draft_layers))
 
     # Compute relative offsets and write GGUF
     cur_rel_offset = 0
@@ -298,17 +315,30 @@ def build_draft_gguf(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build 4-Layer Draft GGUF for Nanbeige4.3-33B")
-    parser.add_argument("--base-gguf", required=True, help="Path to base IQ2_XXS or Hyper GGUF")
+    parser.add_argument("--base-gguf", default=None, help="Path to base IQ2_XXS or Hyper GGUF")
     parser.add_argument("--safetensors", default=None, help="Path to distilled draft_layers_only.safetensors")
+    parser.add_argument("--export-quantized", default=None, help="Export quantized 4-layer bundle (.pkl)")
+    parser.add_argument("--import-quantized", default=None, help="Import quantized 4-layer bundle (.pkl)")
     parser.add_argument("--zero-shot-slice", action="store_true", help="Slice anchor layers directly from base GGUF")
-    parser.add_argument("--out", required=True, help="Output 4-layer Draft GGUF path")
+    parser.add_argument("--out", default=None, help="Output 4-layer Draft GGUF path")
     args = parser.parse_args()
 
-    if not args.safetensors and not args.zero_shot_slice:
-        raise SystemExit("Specify either --safetensors <path> or --zero-shot-slice")
+    if args.export_quantized:
+        if not args.safetensors:
+            raise SystemExit("--export-quantized requires --safetensors")
+        qlayers = quantize_safetensors_layers(args.safetensors, num_draft_layers=4)
+        with open(args.export_quantized, "wb") as fq:
+            pickle.dump(qlayers, fq, protocol=5)
+        sz_gib = os.path.getsize(args.export_quantized) / (1024 ** 3)
+        print(f"Exported quantized 4-layer bundle to {args.export_quantized} ({sz_gib:.3f} GiB)")
+        raise SystemExit(0)
+
+    if not args.base_gguf or not args.out:
+        raise SystemExit("--base-gguf and --out are required when building GGUF")
 
     build_draft_gguf(
         base_gguf_path=args.base_gguf,
         out_gguf_path=args.out,
         safetensors_path=args.safetensors,
+        import_quantized_path=args.import_quantized,
     )
