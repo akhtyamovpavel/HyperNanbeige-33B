@@ -319,18 +319,21 @@ if __name__ == "__main__":
     parser.add_argument("--safetensors", default=None, help="Path to distilled draft_layers_only.safetensors")
     parser.add_argument("--export-quantized", default=None, help="Export quantized 4-layer bundle (.pkl)")
     parser.add_argument("--import-quantized", default=None, help="Import quantized 4-layer bundle (.pkl)")
+    parser.add_argument("--layers", default="0,17,34,51", help="Comma-separated anchor layer indices")
     parser.add_argument("--zero-shot-slice", action="store_true", help="Slice anchor layers directly from base GGUF")
-    parser.add_argument("--out", default=None, help="Output 4-layer Draft GGUF path")
+    parser.add_argument("--out", default=None, help="Output Draft GGUF path")
     args = parser.parse_args()
+
+    anchor_layers = [int(x.strip()) for x in args.layers.split(",") if x.strip()]
 
     if args.export_quantized:
         if not args.safetensors:
             raise SystemExit("--export-quantized requires --safetensors")
-        qlayers = quantize_safetensors_layers(args.safetensors, num_draft_layers=4)
+        qlayers = quantize_safetensors_layers(args.safetensors, num_draft_layers=len(anchor_layers))
         with open(args.export_quantized, "wb") as fq:
             pickle.dump(qlayers, fq, protocol=5)
         sz_gib = os.path.getsize(args.export_quantized) / (1024 ** 3)
-        print(f"Exported quantized 4-layer bundle to {args.export_quantized} ({sz_gib:.3f} GiB)")
+        print(f"Exported quantized {len(anchor_layers)}-layer bundle to {args.export_quantized} ({sz_gib:.3f} GiB)")
         raise SystemExit(0)
 
     if not args.base_gguf or not args.out:
@@ -341,4 +344,5 @@ if __name__ == "__main__":
         out_gguf_path=args.out,
         safetensors_path=args.safetensors,
         import_quantized_path=args.import_quantized,
+        anchor_layers=anchor_layers,
     )

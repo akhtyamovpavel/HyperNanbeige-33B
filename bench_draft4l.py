@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Benchmark Nanbeige4.3-33B-Hyper.gguf + Nanbeige4.3-33B-Draft-4L.gguf on RTX 3090."""
 
+import argparse
 import json
 import subprocess
 import time
@@ -19,10 +20,10 @@ from switch_multithread import (
 )
 
 
-def run_test():
+def run_test(draft_name: str = "Nanbeige4.3-33B-Draft-4L.gguf"):
     stop_existing()
-    draft_path = WORKDIR / "models" / "Nanbeige4.3-33B-Draft-4L.gguf"
-    log_path = WORKDIR / "server_draft4l.log"
+    draft_path = WORKDIR / "models" / draft_name
+    log_path = WORKDIR / f"server_{draft_name}.log"
 
     cmd = [
         str(OLLAMA_DIR / "llama-server"),
@@ -107,4 +108,7 @@ def run_test():
 
 
 if __name__ == "__main__":
-    run_test()
+    p = argparse.ArgumentParser()
+    p.add_argument("--draft", default="Nanbeige4.3-33B-Draft-4L.gguf")
+    args = p.parse_args()
+    run_test(args.draft)

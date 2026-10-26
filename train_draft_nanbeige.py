@@ -15,6 +15,7 @@ import json
 import math
 import os
 import pathlib
+import random
 import time
 
 # Default all caches to /mnt/h3-builds (1.6 TB NVMe) before importing huggingface/torch
@@ -40,6 +41,14 @@ SEED_PROMPTS = [
     "Напиши скрипт на Python для парсинга заголовка GGUF-файла через `mmap` и `struct` с выводом списка тензоров и их размеров.",
     "Debug a Kubernetes `CrashLoopBackOff` where readinessProbe fails on port 8000 due to slow model weight initialization in FastAPI lifespan.",
     "Реализуй алгоритм `Regularized Evolution` для аппаратно-зависимого поиска архитектуры нейросети (Hardware-Aware NAS) под лимит SRAM <= 10 КБ.",
+    "Write a Python function `merge_k_sorted_lists` using `heapq` with type annotations, docstring, and `pytest` unit tests.",
+    "Solve for integers x, y: x^2 - y^2 = 45. List all positive integer solutions and prove completeness.",
+    "Write a SQL query using `ROW_NUMBER()` and `LAG()` to find the day-over-day revenue change per store.",
+    "Напиши асинхронный клиент на `httpx` с экспоненциальным backoff, jitter и лимитом конкурентности через `asyncio.Semaphore`.",
+    "Explain how RoPE (Rotary Position Embedding) head permutation differs between HuggingFace Llama and GGML.",
+    "Реализуй алгоритм консистентного хэширования (`Consistent Hashing`) с виртуальными узлами на Python.",
+    "Write a Bash script that monitors GPU VRAM via `nvidia-smi` and restarts a systemd service if free memory drops below 256 MiB.",
+    "Объясни устройство `MVCC` и `Vacuum` в PostgreSQL и почему длинные транзакции вызывают раздувание таблиц (table bloat).",
 ]
 
 
@@ -164,18 +173,17 @@ def compute_distill_loss(
         tk_vals_s = torch.gather(logits_s, dim=-1, index=tk_idx).float()
         tk_vals_t_f = tk_vals_t.float()
 
-        log_p_t = F.log_softmax(tk_vals_t_f / temp, dim=-1)
-        log_p_s = F.log_softmax(tk_vals_s / temp, dim=-1)
-        p_t = log_p_t.exp()
-        p_s = log_p_s.exp()
+        log_p_t = F.log_softmax(tk_vals_t_f / temp, dim=-1).clamp(min=-30.0)
+        log_p_s = F.log_softmax(tk_vals_s / temp, dim=-1).clamp(min=-30.0)
 
-        fwd_kl = F.kl_div(log_p_s, p_t, reduction="batchmean") * (temp ** 2)
-        rev_kl = F.kl_div(log_p_t, p_s, reduction="batchmean") * (temp ** 2)
-        kl_total = kl_total + 0.5 * (fwd_kl + rev_kl)
+        n_chunk_toks = max(1, tk_vals_s.shape[0] * tk_vals_s.shape[1])
+        fwd_kl = (F.kl_div(log_p_s, log_p_t, reduction="sum", log_target=True) / n_chunk_toks) * (temp ** 2)
+        rev_kl = (F.kl_div(log_p_t, log_p_s, reduction="sum", log_target=True) / n_chunk_toks) * (temp ** 2)
+        kl_total = kl_total + 0.7 * fwd_kl + 0.3 * rev_kl
         n_chunks += 1
 
     kl_loss = kl_total / max(1, n_chunks)
-    total_loss = kl_loss + norm_loss + 0.5 * inter_loss
+    total_loss = 25.0 * kl_loss + norm_loss + 0.5 * inter_loss
     metrics = {
         "loss": round(total_loss.item(), 4),
         "kl": round(kl_loss.item(), 4),
@@ -186,7 +194,48 @@ def compute_distill_loss(
     return total_loss, metrics
 
 
+@torch.no_grad()
+def ensure_teacher_rollouts(
+    teacher: nn.Module,
+    tokenizer,
+    rollouts_path: pathlib.Path,
+    max_new_tokens: int = 320,
+) -> list[str]:
+    if rollouts_path.exists():
+        log(f"Loading cached Teacher rollouts from {rollouts_path}...")
+        out = []
+        for ln in rollouts_path.read_text(encoding="utf-8").splitlines():
+            if ln.strip():
+                obj = json.loads(ln)
+                out.append(f"<|im_start|>user\n{obj['user']}<|im_end|>\n<|im_start|>assistant\n{obj['assistant']}<|im_end|>\n")
+        return out
+
+    log(f"Generating {len(SEED_PROMPTS)} genuine Teacher Self-Distillation rollouts (max_new_tokens={max_new_tokens})...")
+    rollouts_path.parent.mkdir(parents=True, exist_ok=True)
+    formatted = []
+    with rollouts_path.open("w", encoding="utf-8") as f_out:
+        for idx, prompt in enumerate(SEED_PROMPTS, 1):
+            prefix = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            in_ids = tokenizer.encode(prefix, return_tensors="pt").to("cuda:0")
+            gen_ids = teacher.generate(
+                in_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+            gen_txt = "<think>\n" + tokenizer.decode(gen_ids[0, in_ids.shape[1]:], skip_special_tokens=False)
+            rec = {"user": prompt, "assistant": gen_txt}
+            f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f_out.flush()
+            formatted.append(f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{gen_txt}\n")
+            if idx % 4 == 0 or idx == len(SEED_PROMPTS):
+                log(f"  Generated {idx}/{len(SEED_PROMPTS)} Teacher rollouts")
+    return formatted
+
+
 def build_token_batches(
+    teacher: nn.Module,
     tokenizer,
     traces_jsonl: pathlib.Path,
     seq_len: int = 512,
@@ -197,14 +246,23 @@ def build_token_batches(
         for line in traces_jsonl.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 obj = json.loads(line)
-                if obj.get("text"):
-                    texts.append(obj["text"])
-    for p in SEED_PROMPTS:
-        texts.append(f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<think>\n")
+                if "user" in obj and "assistant" in obj:
+                    texts.append(
+                        f"<|im_start|>user\n{obj['user']}<|im_end|>\n<|im_start|>assistant\n{obj['assistant']}<|im_end|>\n"
+                    )
+                elif obj.get("text"):
+                    texts.append(
+                        f"<|im_start|>user\nContinue working on the coding task.<|im_end|>\n<|im_start|>assistant\n{obj['text']}<|im_end|>\n"
+                    )
+
+    rollouts_path = traces_jsonl.parent / "teacher_rollouts.jsonl"
+    rollout_texts = ensure_teacher_rollouts(teacher, tokenizer, rollouts_path, max_new_tokens=320)
+    # Oversample genuine Teacher rollouts 3x so the student strongly aligns to exact chat_template starts
+    texts.extend(rollout_texts * 3)
 
     all_ids = []
     for t in texts:
-        ids = tokenizer.encode(t, add_special_tokens=True)
+        ids = tokenizer.encode(t, add_special_tokens=False)
         all_ids.extend(ids)
 
     batches = []
@@ -280,7 +338,7 @@ def main() -> None:
     assert len(teacher.model.layers) != len(student.backbone.layers), "Teacher layers must remain untouched!"
     log(f"Verified: Teacher has {len(teacher.model.layers)} layers, Student has {len(student.backbone.layers)} layers.")
 
-    batches = build_token_batches(tokenizer, args.traces, seq_len=args.seq_len, device="cuda:0")
+    batches = build_token_batches(teacher, tokenizer, args.traces, seq_len=args.seq_len, device="cuda:0")
     log(f"Prepared {len(batches)} overlapping training windows (seq_len={args.seq_len}, total tokens={len(batches)*args.seq_len:,})")
 
     optimizer = torch.optim.AdamW(student.layers.parameters(), lr=args.lr, weight_decay=0.01)
@@ -289,6 +347,7 @@ def main() -> None:
 
     step = 0
     for epoch in range(1, args.epochs + 1):
+        random.shuffle(batches)
         ep_loss = 0.0
         ep_top1 = 0.0
         ep_top5 = 0.0
@@ -299,9 +358,17 @@ def main() -> None:
             h_norm_t, inter_t = teacher_forward_targets(teacher, input_ids, layer_indices)
             h_norm_s, inter_s = student.forward_hidden(input_ids)
             loss, metrics = compute_distill_loss(student, h_norm_s, inter_s, h_norm_t, inter_t)
+            if not torch.isfinite(loss):
+                log(f"  [WARN] Non-finite loss at step {step}, skipping step")
+                optimizer.zero_grad(set_to_none=True)
+                continue
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(student.layers.parameters(), 1.0)
-            optimizer.step()
+            grad_norm = torch.nn.utils.clip_grad_norm_(student.layers.parameters(), 1.0)
+            if torch.isfinite(grad_norm):
+                optimizer.step()
+            else:
+                log(f"  [WARN] Non-finite grad_norm at step {step}, skipping optimizer.step()")
+                optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
             ep_loss += metrics["loss"]
