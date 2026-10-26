@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "gpu-server": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local GPU Server (RTX 3090 24GB)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8091/v1",
+        "apiKey": "local-no-key"
+      },
+      "models": {
+        "Nanbeige4.3-33B-Hyper": {
+          "name": "Nanbeige4.3-33B-Hyper (Local RTX 3090)",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": true,
+          "limit": {
+            "context": 57344,
+            "output": 8192
+          }
+        }
+      }
+    }
+  },
+  "model": "gpu-server/Nanbeige4.3-33B-Hyper",
+  "small_model": "gpu-server/Nanbeige4.3-33B-Hyper"
+}
