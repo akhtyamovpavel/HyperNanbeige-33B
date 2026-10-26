@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 *.gguf
+*.safetensors
 *.log
+data/*.jsonl
 .venv/
 .env

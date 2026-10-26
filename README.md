@@ -126,6 +126,31 @@ Copy [`configs/opencode.json`](configs/opencode.json) into your project director
 }
 ```
 
+### 4. Train & Build the 4-Layer Neural Speculative Drafter (`Nanbeige4.3-Draft-4L.gguf`)
+
+Because `Nanbeige4.3-33B` uses a `166,912`-token vocabulary, external 0.5B–1.5B models (such as Qwen) cannot act as speculative drafters in `llama-server --model-draft`. We provide a complete **Online Layer-Pruned Distillation** pipeline (`train_draft_nanbeige.py` + `build_draft_gguf.py`):
+
+1. **Online Knowledge Distillation (`train_draft_nanbeige.py`):**
+   - Initializes a 4-layer student from anchor layers `[0, 17, 34, 51]` of `Nanbeige/Nanbeige4.3-33B`, sharing the frozen `embed_tokens`, `norm`, and `lm_head` pointers in GPU VRAM (`0 MB` duplication).
+   - Trains on agentic coding & `<think>...</think>` traces (`data/nanbeige_agentic_traces.jsonl`) using Multi-Layer Hidden Alignment (`SmoothL1 + Cosine`), Pre-Head RMSNorm Alignment, and Chunked Top-128 Symmetric KL Divergence.
+   ```bash
+   python3 train_draft_nanbeige.py \
+     --teacher Nanbeige/Nanbeige4.3-33B \
+     --traces ./data/nanbeige_agentic_traces.jsonl \
+     --out-dir ./models/Nanbeige4.3-Draft-4L \
+     --layers 0,17,34,51 \
+     --epochs 6
+   ```
+
+2. **GGUF Stitching & Quantization (`build_draft_gguf.py`):**
+   - Applies HuggingFace-to-GGML RoPE head permutation (`56` Q heads, `8` KV heads), quantizes attention weights to `Q8_0` and MLP weights to `Q4_0`, and stitches the 4 distilled layers with the exact vocabulary embeddings and `output.weight` from the base GGUF (`~1.2 GiB` total):
+   ```bash
+   python3 build_draft_gguf.py \
+     --base-gguf ./models/Nanbeige_Nanbeige4.3-33B-IQ2_XXS.gguf \
+     --safetensors ./models/Nanbeige4.3-Draft-4L/draft_layers_only.safetensors \
+     --out ./models/Nanbeige4.3-33B-Draft-4L.gguf
+   ```
+
 ## License
 
 MIT License (scripts and configuration). Model weights inherit the license of [`Nanbeige/Nanbeige4.3-33B`](https://huggingface.co/Nanbeige/Nanbeige4.3-33B) (Apache 2.0).
