@@ -13,7 +13,17 @@ Usage:
 import argparse
 import os
 import pathlib
-from huggingface_hub import HfApi
+import tempfile
+
+# Avoid PermissionError if ~/.cache/huggingface/xet is owned by root
+_cache_root = pathlib.Path(os.environ.get("HF_WRITE_CACHE", pathlib.Path(tempfile.gettempdir()) / f"hf_cache_{os.getuid()}"))
+_cache_root.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_HOME", str(_cache_root))
+os.environ.setdefault("HF_HUB_CACHE", str(_cache_root / "hub"))
+os.environ.setdefault("HF_XET_CACHE", str(_cache_root / "xet"))
+os.environ.setdefault("XET_CACHE_DIR", str(_cache_root / "xet"))
+
+from huggingface_hub import HfApi  # noqa: E402
 
 
 def main() -> None:
